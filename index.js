@@ -272,10 +272,34 @@ fastify.register(async (fastify) => {
     });
 });
 
-fastify.listen({ port: PORT }, (err) => {
-    if (err) {
-        console.error(err);
-        process.exit(1);
-    }
-    console.log(`Server is listening on port ${PORT}`);
+const PORT = process.env.PORT || 5050;
+
+fastify.listen({ port: PORT, host: "0.0.0.0" }, (err) => {
+  if (err) {
+    fastify.log.error(err);
+    process.exit(1);
+  }
+  console.log(`🚀 Server listening on ${PORT}`);
 });
+
+fastify.get("/health", async (req, reply) => {
+  return { ok: true };
+});
+
+fastify.all("/incoming-call", async (req, reply) => {
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  const wsUrl = `wss://${host}/media-stream`;
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Chantal" language="fr-CA">
+    Bienvenue chez ABC Déneigement. Dites-moi comment je peux vous aider.
+  </Say>
+  <Connect>
+    <Stream url="${wsUrl}" />
+  </Connect>
+</Response>`;
+
+  reply.type("text/xml").send(twiml);
+});
+
