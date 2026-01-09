@@ -29,7 +29,7 @@ Si on demande un rendez-vous avant 8:30 ou le weekend: refuser et proposer un au
 
 const VOICE = 'alloy';
 const TEMPERATURE = 0.8; // Controls the randomness of the AI's responses
-const PORT = process.env.PORT || 5050; // Allow dynamic port assignment
+
 
 // List of Event Types to log to the console. See the OpenAI Realtime API Documentation: https://platform.openai.com/docs/api-reference/realtime
 const LOG_EVENT_TYPES = [
