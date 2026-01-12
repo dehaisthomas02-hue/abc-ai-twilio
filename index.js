@@ -1,4 +1,49 @@
-@@ -47,134 +47,154 @@ fastify.get("/health", async () => ({ ok: true }));
+import Fastify from "fastify";
+import WebSocket from "ws";
+import dotenv from "dotenv";
+import fastifyFormBody from "@fastify/formbody";
+import fastifyWs from "@fastify/websocket";
+
+dotenv.config();
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+if (!OPENAI_API_KEY) {
+  console.error("❌ Missing OPENAI_API_KEY in Railway Variables");
+  process.exit(1);
+}
+
+// ✅ Mets un modèle Realtime valide ici si tu veux en forcer un.
+// Sinon laisse la valeur par défaut.
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-realtime-preview";
+
+// Instructions (fr-CA)
+const SYSTEM_MESSAGE = `Tu es l’agent téléphonique du service à la clientèle de ABC Déneigement (Montréal).
+Tu parles français québécois (fr-CA). Ton est naturel, empathique, professionnel.
+Objectif: aider le client rapidement, poser des questions de clarification si nécessaire.
+
+Règles:
+- Heures: Lun-Ven 8:30 à 17:00. Fermé samedi/dimanche.
+- Si on demande un rendez-vous avant 8:30 ou le weekend: refuser et proposer un autre créneau.
+- Si tu n'as pas une info (ex: "combien de camions?"), dis-le clairement et propose de transférer à un superviseur.
+
+Style:
+- Réponses courtes, naturelles, conversationnelles.
+- Tu peux reformuler la demande pour confirmer.
+`;
+
+const VOICE = process.env.OPENAI_VOICE || "alloy"; // voix OpenAI (ex: alloy)
+
+const fastify = Fastify({ logger: true });
+fastify.register(fastifyFormBody);
+fastify.register(fastifyWs);
+
+// Health
+fastify.get("/", async () => ({ ok: true }));
+fastify.get("/health", async () => ({ ok: true }));
+
+/**
+ * ✅ Twilio webhook (Voice URL)
+ * Mets dans Twilio: https://TON-DOMAINE/incoming-call
  */
 fastify.all("/incoming-call", async (req, reply) => {
   const host = req.headers["x-forwarded-host"] || req.headers.host;
@@ -17,7 +62,7 @@ fastify.all("/incoming-call", async (req, reply) => {
 
 // WebSocket route: Twilio Media Streams
 fastify.register(async function (fastify) {
-  fastify.get("/media-stream", { websocket: true }, (connection, req) => {
+  fastify.get("/media-stream", { websocket: true }, (connection) => {
     console.log("✅ Twilio WS client connected");
 
     let streamSid = null;
@@ -45,7 +90,6 @@ fastify.register(async function (fastify) {
       const sessionUpdate = {
         type: "session.update",
         session: {
-          type: "realtime",
           modalities: ["audio", "text"],
           instructions: SYSTEM_MESSAGE,
           voice: VOICE,
@@ -106,7 +150,6 @@ fastify.register(async function (fastify) {
       // ✅ Quand OpenAI commit le buffer (VAD), on demande UNE réponse.
       // Ça évite de spam response.create sur speech_stopped / etc.
       if (evt.type === "input_audio_buffer.committed") {
-        if (!responseLocked) {
         if (!sessionReady) {
           pendingResponseCreate = true;
           console.log("⏳ committed before session.updated -> queue response.create");
@@ -155,7 +198,23 @@ fastify.register(async function (fastify) {
         return;
       }
 
-@@ -198,27 +218,25 @@ fastify.register(async function (fastify) {
+      if (data.event === "media") {
+        // payload = base64 g711_ulaw
+        if (openAiWs.readyState === WebSocket.OPEN) {
+          openAiWs.send(
+            JSON.stringify({
+              type: "input_audio_buffer.append",
+              audio: data.media.payload,
+            })
+          );
+        }
+        return;
+      }
+
+      if (data.event === "stop") {
+        console.log("⏹️ Twilio stream stop");
+        try {
+          openAiWs.close();
         } catch {}
         return;
       }
@@ -179,4 +238,3 @@ fastify.listen({ port: PORT, host: "0.0.0.0" }, (err) => {
   }
   console.log(`🚀 Server listening on ${PORT}`);
 });
-
