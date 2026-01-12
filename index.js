@@ -1,33 +1,4 @@
-import Fastify from "fastify";
-import WebSocket from "ws";
-import dotenv from "dotenv";
-import fastifyFormBody from "@fastify/formbody";
-import fastifyWs from "@fastify/websocket";
-
-dotenv.config();
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error("❌ Missing OPENAI_API_KEY in Railway Variables");
-  process.exit(1);
-}
-
-// ✅ Mets un modèle Realtime valide ici si tu veux en forcer un.
-// Sinon laisse la valeur par défaut.
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-realtime-preview";
-
-// Instructions (fr-CA)
-const SYSTEM_MESSAGE = `Tu es l’agent téléphonique du service à la clientèle de ABC Déneigement (Montréal).
-Tu parles français québécois (fr-CA). Ton est naturel, empathique, professionnel.
-Objectif: aider le client rapidement, poser des questions de clarification si nécessaire.
-
-Règles:
-- Heures: Lun-Ven 8:30 à 17:00. Fermé samedi/dimanche.
-- Si on demande un rendez-vous avant 8:30 ou le weekend: refuser et proposer un autre créneau.
-- Si tu n'as pas une info (ex: "combien de camions?"), dis-le clairement et propose de transférer à un superviseur.
-
-Style:
-- Réponses courtes, naturelles, conversationnelles.
+@@ -31,149 +31,187 @@ Style:
 - Tu peux reformuler la demande pour confirmer.
 `;
 
@@ -54,6 +25,7 @@ fastify.all("/incoming-call", async (req, reply) => {
   <Say voice="Polly.Chantal" language="fr-CA">Bienvenue chez ABC Déneigement. Dites-moi comment je peux vous aider.</Say>
   <Connect>
     <Stream url="${wsUrl}" track="inbound_track"/>
+    <Stream url="${wsUrl}" track="both_tracks"/>
   </Connect>
 </Response>`;
 
@@ -62,6 +34,7 @@ fastify.all("/incoming-call", async (req, reply) => {
 
 // WebSocket route: Twilio Media Streams
 fastify.register(async function (fastify) {
+  fastify.get("/media-stream", { websocket: true }, (connection, req) => {
   fastify.get("/media-stream", { websocket: true }, (connection) => {
     console.log("✅ Twilio WS client connected");
 
@@ -69,6 +42,7 @@ fastify.register(async function (fastify) {
 
     // 🔒 Pour éviter conversation_already_has_active_response
     let responseLocked = false;
+    let responseInProgress = false;
     let sessionReady = false;
     let pendingResponseCreate = false;
 
@@ -90,6 +64,7 @@ fastify.register(async function (fastify) {
       const sessionUpdate = {
         type: "session.update",
         session: {
+          type: "realtime",
           modalities: ["audio", "text"],
           instructions: SYSTEM_MESSAGE,
           voice: VOICE,
@@ -102,6 +77,25 @@ fastify.register(async function (fastify) {
 
       console.log("🧩 Sending session.update");
       openAiWs.send(JSON.stringify(sessionUpdate));
+    };
+
+    const trySendResponseCreate = (reason) => {
+      if (!sessionReady) {
+        pendingResponseCreate = true;
+        console.log("⏳ response.create pending (session not ready)");
+        return;
+      }
+      if (responseLocked || responseInProgress) {
+        pendingResponseCreate = true;
+        console.log("⏳ response.create pending (response in progress)");
+        return;
+      }
+
+      responseLocked = true;
+      pendingResponseCreate = false;
+      audioDeltas = 0;
+      openAiWs.send(JSON.stringify({ type: "response.create" }));
+      console.log(`🗣️ response.create sent (${reason})`);
     };
 
     openAiWs.on("open", () => {
@@ -125,13 +119,13 @@ fastify.register(async function (fastify) {
 
       if (evt.type === "session.updated") {
         sessionReady = true;
-        if (pendingResponseCreate && !responseLocked) {
-          responseLocked = true;
-          pendingResponseCreate = false;
-          audioDeltas = 0;
-          openAiWs.send(JSON.stringify({ type: "response.create" }));
-          console.log("🗣️ response.create sent (after session.updated)");
+        if (pendingResponseCreate) {
+          trySendResponseCreate("after session.updated");
         }
+      }
+
+      if (evt.type === "response.created" || evt.type === "response.started") {
+        responseInProgress = true;
       }
 
       // ✅ Audio AI -> Twilio
@@ -150,10 +144,7 @@ fastify.register(async function (fastify) {
       // ✅ Quand OpenAI commit le buffer (VAD), on demande UNE réponse.
       // Ça évite de spam response.create sur speech_stopped / etc.
       if (evt.type === "input_audio_buffer.committed") {
-        if (!sessionReady) {
-          pendingResponseCreate = true;
-          console.log("⏳ committed before session.updated -> queue response.create");
-        } else if (!responseLocked) {
+        if (!responseLocked) {
           responseLocked = true;
           audioDeltas = 0;
           openAiWs.send(JSON.stringify({ type: "response.create" }));
@@ -161,17 +152,26 @@ fastify.register(async function (fastify) {
         } else {
           console.log("⚠️ committed but response already locked -> ignore");
         }
+        trySendResponseCreate("after committed");
       }
 
       // ✅ Quand réponse terminée -> unlock
       if (evt.type === "response.done") {
         responseLocked = false;
+        responseInProgress = false;
         console.log(`✅ response.done (unlock) | audio deltas sent=${audioDeltas}`);
+        if (pendingResponseCreate) {
+          trySendResponseCreate("after response.done");
+        }
       }
 
       if (evt.type === "response.failed" || evt.type === "response.canceled") {
         responseLocked = false;
+        responseInProgress = false;
         console.log(`⚠️ ${evt.type} (unlock) | audio deltas sent=${audioDeltas}`);
+        if (pendingResponseCreate) {
+          trySendResponseCreate(`after ${evt.type}`);
+        }
       }
     });
 
@@ -197,22 +197,7 @@ fastify.register(async function (fastify) {
         console.log(`▶️ Twilio stream start sid=${streamSid}`);
         return;
       }
-
-      if (data.event === "media") {
-        // payload = base64 g711_ulaw
-        if (openAiWs.readyState === WebSocket.OPEN) {
-          openAiWs.send(
-            JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: data.media.payload,
-            })
-          );
-        }
-        return;
-      }
-
-      if (data.event === "stop") {
-        console.log("⏹️ Twilio stream stop");
+@@ -196,29 +234,25 @@ fastify.register(async function (fastify) {
         try {
           openAiWs.close();
         } catch {}
@@ -238,3 +223,4 @@ fastify.listen({ port: PORT, host: "0.0.0.0" }, (err) => {
   }
   console.log(`🚀 Server listening on ${PORT}`);
 });
+
